@@ -78,6 +78,8 @@ class Vehicle:
     departure_B: float = 0.0
     turned_at: str = ''  # 'A', 'B', or '' (through)
     exited: bool = False
+    service_time_A: float = 0.0
+    service_time_B: float = 0.0
 
     @property
     def priority(self):
@@ -260,8 +262,6 @@ class SignalController:
 
     def _preemption_sequence(self):
         """Execute preemption: clearance -> emergency green -> resume."""
-        preempt_start = self.env.now
-
         # Reset all green events
         self._reset_ns_event()
         self._reset_we_event()
@@ -276,13 +276,14 @@ class SignalController:
         yield self.env.timeout(self.p['emergency_green'])
 
         self._reset_ns_event()
+        _emergency_end = self.env.now  # end of emergency service phase
 
-        # 3. Resume normal cycle
-        # Amber transition back
+        # 3. Resume normal cycle — amber transition back
         self._set_phase(self.AMBER_NS)
         yield self.env.timeout(self.p['amber'])
 
-        recovery_time = self.env.now - preempt_start
+        # Recovery time: from end of emergency green to normal cycle resume
+        recovery_time = self.env.now - _emergency_end
         self.recovery_times.append(recovery_time)
 
         self.preempting = False
@@ -410,6 +411,7 @@ class Intersection:
     - A signal controller
     - A PriorityResource for NS approach (capacity=1)
     - A PriorityResource for WE approach (capacity=1)
+    - Queue length tracking for both approaches
     """
 
     def __init__(self, env, name, params, offset=0, stats=None):
@@ -425,71 +427,93 @@ class Intersection:
         self.ns_server = simpy.PriorityResource(env, capacity=1)
         self.we_server = simpy.PriorityResource(env, capacity=1)
 
+        # Queue length tracking: counts ALL waiting vehicles (for green + server)
+        self.ns_waiting = 0
+        self.we_waiting = 0
+        self.ns_queue_log = []   # list of (time, count)
+        self.we_queue_log = []
+
+    def ns_join(self):
+        self.ns_waiting += 1
+        self.ns_queue_log.append((self.env.now, self.ns_waiting))
+
+    def ns_leave(self):
+        self.ns_waiting -= 1
+        self.ns_queue_log.append((self.env.now, self.ns_waiting))
+
+    def we_join(self):
+        self.we_waiting += 1
+        self.we_queue_log.append((self.env.now, self.we_waiting))
+
+    def we_leave(self):
+        self.we_waiting -= 1
+        self.we_queue_log.append((self.env.now, self.we_waiting))
+
 
 # ============================================================
 # 6. VEHICLE PROCESSES
 # ============================================================
 
 def ns_vehicle_at_intersection(env, vehicle, intersection, service_rng,
-                               turn_rng, turn_prob, link=None,
-                               link_entry=True, stats=None, warmup=900):
+                               will_turn, link=None,
+                               stats=None, warmup=900):
     """
     Process for a N/S vehicle at one intersection.
-    
+
+    Args:
+        will_turn: pre-decided bool — True if this vehicle turns east here.
+        link:      downstream link; only needed when will_turn is False.
+
     Steps:
-    1. Wait for NS green
-    2. Request server with priority
-    3. Check downstream blocking (if going straight to link)
-    4. Cross intersection (service time)
-    5. Decide: turn E or go straight
-    
-    Returns: 'straight' or 'turned'
+        1. Join queue count
+        2. Emergency preemption (if applicable)
+        3. Wait for NS green AND (if going straight) link not full
+        4. Request server with priority
+        5. Cross intersection (service time)
+        6. Leave queue count
+
+    Returns: ('straight' | 'turned', service_time)
     """
     is_emergency = vehicle.vtype == 'emergency'
+
+    # --- Join queue ---
+    intersection.ns_join()
 
     # --- Emergency preemption logic ---
     if is_emergency and not intersection.signal.is_ns_green():
         preempt_proc = intersection.signal.request_preemption()
         if preempt_proc is not None:
-            yield preempt_proc  # wait for clearance + green
-            # After preemption, NS is green now
-            # Small delay to let the phase settle
+            yield preempt_proc
             yield env.timeout(0)
 
-    # --- Wait for NS green ---
-    while not intersection.signal.is_ns_green():
-        yield intersection.signal.wait_for_ns_green()
-        yield env.timeout(0)  # let phase events settle
-
-    # --- If going straight and link exists, check blocking ---
-    if link_entry and link is not None and not is_emergency:
-        # Must wait for BOTH: NS green AND link not full
-        while intersection.signal.is_ns_green() and link.is_full():
-            # Wait for a slot to open, but re-check green after
-            yield link.wait_for_slot()
-            yield env.timeout(0)
-
-        # Re-check NS green (might have turned red while waiting for slot)
+    # --- Combined wait: NS green AND (turning OR link has space) ---
+    while True:
+        # Wait for NS green
         while not intersection.signal.is_ns_green():
             yield intersection.signal.wait_for_ns_green()
             yield env.timeout(0)
 
-        # Track blocking
-        if stats is not None and link.is_full() and env.now > warmup:
-            stats['blocking_events'].append(env.now)
+        # Straight non-emergency vehicles also need link capacity
+        if not will_turn and link is not None and not is_emergency:
+            if link.is_full():
+                # Blocking: NS is green but link is full
+                if stats is not None and env.now > warmup:
+                    stats['blocking_events'].append(env.now)
+                yield link.wait_for_slot()
+                yield env.timeout(0)
+                continue  # re-check green after slot opens
+        break  # both conditions satisfied
 
     # --- Request server (priority queue) ---
     req = intersection.ns_server.request(priority=vehicle.priority)
     yield req
 
-    # --- Double-check signal is still green ---
-    # (In edge cases, signal might have changed during queue wait)
+    # --- Double-check signal (edge case: phase changed while in server queue) ---
     if not intersection.signal.is_ns_green() and not is_emergency:
         intersection.ns_server.release(req)
-        # Need to re-wait — recursive-like via loop
-        # Release and re-enter the queue next green
-        yield intersection.signal.wait_for_ns_green()
-        yield env.timeout(0)
+        while not intersection.signal.is_ns_green():
+            yield intersection.signal.wait_for_ns_green()
+            yield env.timeout(0)
         req = intersection.ns_server.request(priority=vehicle.priority)
         yield req
 
@@ -497,15 +521,15 @@ def ns_vehicle_at_intersection(env, vehicle, intersection, service_rng,
     service_time = service_rng.exponential(PARAMS['mu_s'])
     yield env.timeout(service_time)
 
-    # --- Release server ---
+    # --- Release server and leave queue ---
     intersection.ns_server.release(req)
+    intersection.ns_leave()
 
-    # --- Turning decision ---
-    if turn_rng.random() < turn_prob:
+    if will_turn:
         vehicle.turned_at = intersection.name
-        return 'turned'
-    
-    return 'straight'
+        return 'turned', service_time
+
+    return 'straight', service_time
 
 
 def we_vehicle_process(env, vehicle, intersection, service_rng,
@@ -516,6 +540,9 @@ def we_vehicle_process(env, vehicle, intersection, service_rng,
     """
     arrive_time = env.now
 
+    # Join queue
+    intersection.we_join()
+
     # Wait for WE green
     while not intersection.signal.is_we_green():
         yield intersection.signal.wait_for_we_green()
@@ -525,11 +552,12 @@ def we_vehicle_process(env, vehicle, intersection, service_rng,
     req = intersection.we_server.request(priority=PRIORITY_WE_CAR)
     yield req
 
-    # Check still green
+    # Check still green (edge case)
     if not intersection.signal.is_we_green():
         intersection.we_server.release(req)
-        yield intersection.signal.wait_for_we_green()
-        yield env.timeout(0)
+        while not intersection.signal.is_we_green():
+            yield intersection.signal.wait_for_we_green()
+            yield env.timeout(0)
         req = intersection.we_server.request(priority=PRIORITY_WE_CAR)
         yield req
 
@@ -538,68 +566,87 @@ def we_vehicle_process(env, vehicle, intersection, service_rng,
     yield env.timeout(svc)
 
     intersection.we_server.release(req)
+    intersection.we_leave()
 
     # Record stats
     if stats is not None and env.now > warmup:
         delay = env.now - arrive_time
         stats[f'we_delay_{intersection.name}'].append(delay)
-        vehicle.exited = True
+    vehicle.exited = True
 
 
 def southbound_vehicle_process(env, vehicle, intA, intB, link,
                                 service_rng, turn_rng, stats, warmup=900):
     """
-    Full lifecycle of a southbound (N/S) vehicle entering at A.
-    
-    A -> (maybe turn) -> link -> B -> (maybe turn) -> exit north
+    Full lifecycle of a N/S vehicle entering at A.
+
+    Turning is pre-decided on arrival at each intersection so that the
+    downstream blocking check only applies to straight-going vehicles.
+
+    Delay definition: total system time minus free-flow link traversal
+    time (20 s).  Service times at intersections are included in delay
+    because they can involve signal-induced queuing.
     """
     vehicle.arrival_at_A = env.now
 
+    # Pre-decide turning at A (before joining queue, so blocking check
+    # inside ns_vehicle_at_intersection is applied only to through vehicles)
+    will_turn_A = (turn_rng.random() < PARAMS['turn_A'])
+
     # --- Intersection A ---
     vehicle.service_start_A = env.now
-    result_A = yield env.process(
+    result_A, svc_A = yield env.process(
         ns_vehicle_at_intersection(
-            env, vehicle, intA, service_rng, turn_rng,
-            turn_prob=PARAMS['turn_A'],
-            link=link, link_entry=True,
+            env, vehicle, intA, service_rng,
+            will_turn=will_turn_A,
+            link=link,
             stats=stats, warmup=warmup
         )
     )
     vehicle.departure_A = env.now
+    vehicle.service_time_A = svc_A
 
     if result_A == 'turned':
-        # Vehicle turned E at A — done
         vehicle.exited = True
         if env.now > warmup and stats is not None:
-            delay_A = vehicle.departure_A - vehicle.arrival_at_A
-            stats['turned_A_delay'].append(delay_A)
+            stats['turned_A_delay'].append(vehicle.departure_A - vehicle.arrival_at_A)
         return
 
     # --- Link A -> B ---
     yield env.process(link._traverse(vehicle))
-
     vehicle.arrival_at_B = env.now
+
+    # Pre-decide turning at B
+    will_turn_B = (turn_rng.random() < PARAMS['turn_B'])
 
     # --- Intersection B ---
     vehicle.service_start_B = env.now
-    result_B = yield env.process(
+    result_B, svc_B = yield env.process(
         ns_vehicle_at_intersection(
-            env, vehicle, intB, service_rng, turn_rng,
-            turn_prob=PARAMS['turn_B'],
-            link=None, link_entry=False,
+            env, vehicle, intB, service_rng,
+            will_turn=will_turn_B,
+            link=None,
             stats=stats, warmup=warmup
         )
     )
     vehicle.departure_B = env.now
+    vehicle.service_time_B = svc_B
     vehicle.exited = True
 
-    # --- Record stats ---
+    # --- Record stats (post-warmup only) ---
     if env.now > warmup and stats is not None:
-        total_delay = vehicle.departure_B - vehicle.arrival_at_A
+        # Delay = total time − free-flow link travel time (20 s)
+        free_flow_link = PARAMS['L'] / PARAMS['vf']
+        delay = (vehicle.departure_B - vehicle.arrival_at_A) - free_flow_link
+
         if result_B == 'turned':
-            stats['turned_B_delay'].append(total_delay)
+            stats['turned_B_delay'].append(delay)
         else:
-            stats['through_delay'].append(total_delay)
+            # Separate emergency delays so they don't dilute car/bus average
+            if vehicle.vtype == 'emergency':
+                stats['emergency_through_delay'].append(delay)
+            else:
+                stats['through_delay'].append(delay)
             stats['throughput_exits'].append(env.now)
 
 
@@ -670,11 +717,10 @@ def we_arrival_generator(env, intersection, arrival_rng, service_rng,
 # ============================================================
 
 def compute_time_average(log, sim_time, warmup):
-    """Compute time-weighted average from (time, value) log."""
+    """Time-weighted average from (time, value) log (used for link occupancy)."""
     if not log:
         return 0.0
     total = 0.0
-    count = 0
     for i in range(len(log) - 1):
         t_i, v_i = log[i]
         t_next, _ = log[i + 1]
@@ -684,30 +730,70 @@ def compute_time_average(log, sim_time, warmup):
         t_end = t_next
         if t_end > t_start:
             total += v_i * (t_end - t_start)
-            count += 1
     duration = sim_time - warmup
     return total / duration if duration > 0 else 0.0
 
 
-def compute_kpis(stats, link, sim_time, warmup):
+def compute_queue_stats(log, sim_time, warmup):
+    """
+    Compute max and time-weighted average queue length from (time, count) log.
+    The last observed value is held until sim_time.
+    """
+    if not log:
+        return 0, 0.0
+    # Filter to post-warmup events, keeping the last pre-warmup value as initial
+    last_before = 0
+    for t, v in log:
+        if t <= warmup:
+            last_before = v
+    relevant = [(max(t, warmup), v) for t, v in log if t >= warmup]
+    if not relevant:
+        return last_before, float(last_before)
+
+    max_q = max(v for _, v in relevant)
+
+    # Time-weighted average over [warmup, sim_time]
+    total = 0.0
+    # Interval from warmup to first event
+    if relevant[0][0] > warmup:
+        total += last_before * (relevant[0][0] - warmup)
+    for i in range(len(relevant) - 1):
+        t_i, v_i = relevant[i]
+        t_next = relevant[i + 1][0]
+        total += v_i * (t_next - t_i)
+    # Last interval to sim_time
+    total += relevant[-1][1] * (sim_time - relevant[-1][0])
+
+    duration = sim_time - warmup
+    avg_q = total / duration if duration > 0 else 0.0
+    return max_q, avg_q
+
+
+def compute_kpis(stats, link, intA, intB, sim_time, warmup):
     """Compute all KPIs from collected statistics."""
     duration = sim_time - warmup
     kpis = {}
 
-    # 1. Average delay (through NS traffic)
-    if stats['through_delay']:
-        kpis['avg_delay_through'] = np.mean(stats['through_delay'])
-    else:
-        kpis['avg_delay_through'] = 0.0
+    # 1a. Average delay — through NS traffic (cars and buses only)
+    through = stats.get('through_delay', [])
+    kpis['avg_delay_through'] = np.mean(through) if through else 0.0
 
-    # 1b. Average delay (WE traffic)
-    we_delays = []
-    for key in ['we_delay_A', 'we_delay_B']:
-        we_delays.extend(stats.get(key, []))
+    # 1b. Average delay — W/E traffic
+    we_delays = stats.get('we_delay_A', []) + stats.get('we_delay_B', [])
     kpis['avg_delay_WE'] = np.mean(we_delays) if we_delays else 0.0
 
-    # 2. Queue lengths (we'll use NS server queue)
-    # (tracked via resource monitoring — simplified here)
+    # 1c. Average delay — emergency vehicles (Scenario 3)
+    emg = stats.get('emergency_through_delay', [])
+    kpis['avg_delay_emergency'] = np.mean(emg) if emg else 0.0
+
+    # 2. Queue lengths (max and time-average) per approach
+    for label, log in [('ns_A', intA.ns_queue_log),
+                       ('we_A', intA.we_queue_log),
+                       ('ns_B', intB.ns_queue_log),
+                       ('we_B', intB.we_queue_log)]:
+        max_q, avg_q = compute_queue_stats(log, sim_time, warmup)
+        kpis[f'max_queue_{label}'] = max_q
+        kpis[f'avg_queue_{label}'] = avg_q
 
     # 3. Throughput (vehicles/hour exiting north at B)
     exits = [t for t in stats.get('throughput_exits', []) if t > warmup]
@@ -719,11 +805,10 @@ def compute_kpis(stats, link, sim_time, warmup):
     )
 
     # 5. Downstream blocking frequency
-    # (fraction of cycles with at least one blocking event)
+    #    (fraction of cycles in which ≥1 N/S vehicle at A was blocked)
     n_cycles = duration / PARAMS['C']
     blocking_times = [t for t in stats.get('blocking_events', []) if t > warmup]
     if n_cycles > 0:
-        # Count unique cycles with blocking
         blocked_cycles = set()
         for t in blocking_times:
             cycle_num = int((t - warmup) / PARAMS['C'])
@@ -732,8 +817,7 @@ def compute_kpis(stats, link, sim_time, warmup):
     else:
         kpis['blocking_frequency'] = 0.0
 
-    # 6. Preemption stats
-    kpis['n_served_through'] = len(stats.get('through_delay', []))
+    kpis['n_served_through'] = len(through)
     kpis['n_served_WE'] = len(we_delays)
 
     return kpis
@@ -799,7 +883,7 @@ def run_replication(seed, offset=0, enable_emergency=True):
     env.run(until=PARAMS['sim_time'])
 
     # --- Compute KPIs ---
-    kpis = compute_kpis(stats, link, PARAMS['sim_time'], PARAMS['warmup'])
+    kpis = compute_kpis(stats, link, intA, intB, PARAMS['sim_time'], PARAMS['warmup'])
 
     # Add preemption stats from signal controllers
     kpis['preemptions_A'] = intA.signal.preemption_count
