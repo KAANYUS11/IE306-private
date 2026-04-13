@@ -80,3 +80,17 @@ Emergency vehicles still bypass downstream blocking as required, but no longer r
 ## Additional note on preemption/recovery counts
 
 A difference between `preemptions_total` and the number of recorded recovery samples can occur when a preemption starts close to simulation end (`t=7200`) and recovery has not completed yet. In that case, the event is still a valid preemption, but a full recovery duration is not yet observable within the finite run horizon.
+
+## 6) Preemption resume now returns directly to interrupted cycle point (no forced amber)
+
+### Problem
+After emergency green, the controller always inserted an extra `AMBER_NS` interval before resuming the interrupted phase. This could violate the assignment rule "resume from the point in the cycle where interrupted" by adding a phase segment that did not exist at interruption time.
+
+### Fix
+- Removed the unconditional post-preemption `AMBER_NS` step from `_preemption_sequence()`.
+- The controller now transitions from emergency green directly into `_resume_from_interrupted(...)`, which serves the remaining time of the actual interrupted phase.
+- `preempting` is now cleared only when true cycle-point recovery is completed.
+- Updated related docstrings for consistency.
+
+### Impact
+Signal recovery follows the assignment’s cycle-resume semantics more closely and avoids artificial phase drift caused by an extra amber insertion.

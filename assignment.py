@@ -289,7 +289,7 @@ class SignalController:
                 self._preempt_emergency_service_end = t_done
 
     def _preemption_sequence(self):
-        """Execute preemption: clearance -> emergency green -> amber -> resume from
+        """Execute preemption: clearance -> emergency green -> resume from
         interrupted point.  Does NOT re-execute the offset initialisation."""
         self._reset_ns_event()
         self._reset_we_event()
@@ -305,16 +305,11 @@ class SignalController:
         self._reset_ns_event()
         _emergency_green_end = self.env.now
 
-        # 3. Amber transition back
-        self._set_phase(self.AMBER_NS)
-        yield self.env.timeout(self.p['amber'])
-
         recovery_anchor = self._preempt_emergency_service_end
         if recovery_anchor is None:
             recovery_anchor = _emergency_green_end
-        self.preempting = False
 
-        # 4. Complete the interrupted phase's remaining time, then restart the
+        # 3. Complete the interrupted phase's remaining time, then restart the
         #    normal cycle.  Recovery time is recorded inside _resume_from_interrupted
         #    once the cycle is truly back on its regular track.
         yield from self._resume_from_interrupted(recovery_anchor)
@@ -323,7 +318,7 @@ class SignalController:
         """Serve out the remaining time of the phase that was interrupted, continue
         with any subsequent phases in the current half-cycle, then hand off to the
         normal repeating cycle.  Recovery time is measured from end-of-emergency
-        green to the point where the normal cycle resumes."""
+        service to the point where the normal cycle resumes."""
         phase = self.interrupted_phase
         remaining = self.interrupted_remaining
 
@@ -382,8 +377,9 @@ class SignalController:
                 except simpy.Interrupt:
                     return
 
-        # Recovery time: from end of emergency green to when the normal cycle resumes
+        # Recovery time: from end of emergency service to normal-cycle resumption.
         self.recovery_times.append(self.env.now - emergency_end)
+        self.preempting = False
 
         # Restart the repeating cycle — no offset block
         self.cycle_process = self.env.process(self._run_normal_cycle())
