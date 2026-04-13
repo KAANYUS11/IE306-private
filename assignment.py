@@ -6,16 +6,13 @@ emergency preemption, and downstream blocking.
 
 import simpy
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
+from typing import Optional
 
 # ============================================================
-# 1. PARAMETERS & REPRODUCIBILITY
+# 1. PARAMETERS
 # ============================================================
-
-# Base seed for all replications.  Change this single constant to reproduce
-# or vary the entire experiment.  Replication r uses SeedSequence(BASE_SEED + r*100).
-BASE_SEED = 1000
 
 PARAMS = {
     # Geometry
@@ -29,7 +26,6 @@ PARAMS = {
     'g_NS': 45,          # N/S green duration
     'amber': 4,          # amber/all-red clearance
     'g_WE': 37,          # W/E green duration
-    'phi': 20,           # coordination offset = L/vf = 300/15 (s)
 
     # Arrivals
     'lambda_S': 900/3600,    # S entry rate (veh/s)
@@ -144,9 +140,6 @@ class SignalController:
         self.preemption_count = 0
         self.recovery_times = []
 
-        # Tracks the scheduled end-time of the current phase (for interrupted_remaining)
-        self._phase_end_time = 0
-
         # Start the cycle
         self.cycle_process = env.process(self._run_cycle())
 
@@ -182,48 +175,39 @@ class SignalController:
             self.we_green_event = self.env.event()
 
     def _run_cycle(self):
-        """Main signal cycle loop — handles the one-time offset, then delegates to
-        _run_normal_cycle.  The offset logic must NOT be re-entered after a
-        preemption; post-preemption restarts use _run_normal_cycle directly."""
+        """Main signal cycle loop."""
+        # Initial offset delay (for coordination)
         if self.offset > 0:
-            # WE green for (offset − amber) seconds so that, after the amber,
-            # NS_GREEN starts exactly at t = offset (matching the green-wave offset φ).
-            we_init = self.offset - self.p['amber']
+            # During offset, WE gets green first
             self._set_phase(self.WE_GREEN)
             self._fire_we_green()
-            self._phase_end_time = self.env.now + we_init
             try:
-                yield self.env.timeout(we_init)
+                yield self.env.timeout(self.offset)
             except simpy.Interrupt:
-                return
+                return  # preemption during offset
+
             self._reset_we_event()
 
+            # Amber after the partial WE phase
             self._set_phase(self.AMBER_WE)
-            self._phase_end_time = self.env.now + self.p['amber']
             try:
                 yield self.env.timeout(self.p['amber'])
             except simpy.Interrupt:
                 return
 
-        yield from self._run_normal_cycle()
-
-    def _run_normal_cycle(self):
-        """Repeating NS/amber/WE/amber cycle with phase-end-time tracking.
-        Used both by _run_cycle (normal start) and after preemption resume."""
         while True:
             # --- NS GREEN ---
             self._set_phase(self.NS_GREEN)
             self._fire_ns_green()
-            self._phase_end_time = self.env.now + self.p['g_NS']
             try:
                 yield self.env.timeout(self.p['g_NS'])
             except simpy.Interrupt:
-                return
+                return  # preemption takes over
+
             self._reset_ns_event()
 
             # --- AMBER (after NS) ---
             self._set_phase(self.AMBER_NS)
-            self._phase_end_time = self.env.now + self.p['amber']
             try:
                 yield self.env.timeout(self.p['amber'])
             except simpy.Interrupt:
@@ -232,16 +216,15 @@ class SignalController:
             # --- WE GREEN ---
             self._set_phase(self.WE_GREEN)
             self._fire_we_green()
-            self._phase_end_time = self.env.now + self.p['g_WE']
             try:
                 yield self.env.timeout(self.p['g_WE'])
             except simpy.Interrupt:
                 return
+
             self._reset_we_event()
 
             # --- AMBER (after WE) ---
             self._set_phase(self.AMBER_WE)
-            self._phase_end_time = self.env.now + self.p['amber']
             try:
                 yield self.env.timeout(self.p['amber'])
             except simpy.Interrupt:
@@ -264,9 +247,10 @@ class SignalController:
         self.preempting = True
         self.preemption_count += 1
 
-        # Record where we are in the cycle and how much time remains in the phase
+        # Record where we are in the cycle
         self.interrupted_phase = self.phase
-        self.interrupted_remaining = max(0.0, self._phase_end_time - self.env.now)
+        # Calculate remaining time in current phase
+        # (we'll approximate by saving phase identity for resume)
 
         # Interrupt the current cycle process
         if self.cycle_process and self.cycle_process.is_alive:
@@ -277,8 +261,8 @@ class SignalController:
         return preempt_proc
 
     def _preemption_sequence(self):
-        """Execute preemption: clearance -> emergency green -> amber -> resume from
-        interrupted point.  Does NOT re-execute the offset initialisation."""
+        """Execute preemption: clearance -> emergency green -> resume."""
+        # Reset all green events
         self._reset_ns_event()
         self._reset_we_event()
 
@@ -290,88 +274,23 @@ class SignalController:
         self._set_phase(self.PREEMPT_GREEN)
         self._fire_ns_green()
         yield self.env.timeout(self.p['emergency_green'])
-        self._reset_ns_event()
-        _emergency_end = self.env.now
 
-        # 3. Amber transition back
+        self._reset_ns_event()
+        _emergency_end = self.env.now  # end of emergency service phase
+
+        # 3. Resume normal cycle — amber transition back
         self._set_phase(self.AMBER_NS)
         yield self.env.timeout(self.p['amber'])
 
+        # Recovery time: from end of emergency green to normal cycle resume
+        recovery_time = self.env.now - _emergency_end
+        self.recovery_times.append(recovery_time)
+
         self.preempting = False
 
-        # 4. Complete the interrupted phase's remaining time, then restart the
-        #    normal cycle.  Recovery time is recorded inside _resume_from_interrupted
-        #    once the cycle is truly back on its regular track.
-        yield from self._resume_from_interrupted(_emergency_end)
-
-    def _resume_from_interrupted(self, emergency_end):
-        """Serve out the remaining time of the phase that was interrupted, continue
-        with any subsequent phases in the current half-cycle, then hand off to the
-        normal repeating cycle.  Recovery time is measured from end-of-emergency
-        green to the point where the normal cycle resumes."""
-        phase = self.interrupted_phase
-        remaining = self.interrupted_remaining
-
-        if phase == self.AMBER_NS:
-            # Finish remaining amber, then run WE_GREEN + AMBER_WE
-            if remaining > 0:
-                self._set_phase(self.AMBER_NS)
-                self._phase_end_time = self.env.now + remaining
-                try:
-                    yield self.env.timeout(remaining)
-                except simpy.Interrupt:
-                    return
-
-            self._set_phase(self.WE_GREEN)
-            self._fire_we_green()
-            self._phase_end_time = self.env.now + self.p['g_WE']
-            try:
-                yield self.env.timeout(self.p['g_WE'])
-            except simpy.Interrupt:
-                return
-            self._reset_we_event()
-
-            self._set_phase(self.AMBER_WE)
-            self._phase_end_time = self.env.now + self.p['amber']
-            try:
-                yield self.env.timeout(self.p['amber'])
-            except simpy.Interrupt:
-                return
-
-        elif phase == self.WE_GREEN:
-            # Finish remaining WE green, then AMBER_WE
-            if remaining > 0:
-                self._set_phase(self.WE_GREEN)
-                self._fire_we_green()
-                self._phase_end_time = self.env.now + remaining
-                try:
-                    yield self.env.timeout(remaining)
-                except simpy.Interrupt:
-                    return
-                self._reset_we_event()
-
-            self._set_phase(self.AMBER_WE)
-            self._phase_end_time = self.env.now + self.p['amber']
-            try:
-                yield self.env.timeout(self.p['amber'])
-            except simpy.Interrupt:
-                return
-
-        elif phase == self.AMBER_WE:
-            # Finish remaining amber, then fall straight into normal cycle
-            if remaining > 0:
-                self._set_phase(self.AMBER_WE)
-                self._phase_end_time = self.env.now + remaining
-                try:
-                    yield self.env.timeout(remaining)
-                except simpy.Interrupt:
-                    return
-
-        # Recovery time: from end of emergency green to when the normal cycle resumes
-        self.recovery_times.append(self.env.now - emergency_end)
-
-        # Restart the repeating cycle — no offset block
-        self.cycle_process = self.env.process(self._run_normal_cycle())
+        # Restart the normal cycle from the beginning
+        # (simplified: restart from NS green)
+        self.cycle_process = self.env.process(self._run_cycle())
 
     def is_ns_green(self):
         return self.ns_green_on
@@ -508,8 +427,7 @@ class Intersection:
         self.ns_server = simpy.PriorityResource(env, capacity=1)
         self.we_server = simpy.PriorityResource(env, capacity=1)
 
-        # Queue length tracking: vehicles waiting to start service (excludes vehicle
-        # actively crossing the intersection — ns_leave/we_leave fires on service start)
+        # Queue length tracking: counts ALL waiting vehicles (for green + server)
         self.ns_waiting = 0
         self.we_waiting = 0
         self.ns_queue_log = []   # list of (time, count)
@@ -538,7 +456,7 @@ class Intersection:
 
 def ns_vehicle_at_intersection(env, vehicle, intersection, service_rng,
                                will_turn, link=None,
-                               stats=None, warmup=PARAMS['warmup']):
+                               stats=None, warmup=900):
     """
     Process for a N/S vehicle at one intersection.
 
@@ -599,15 +517,13 @@ def ns_vehicle_at_intersection(env, vehicle, intersection, service_rng,
         req = intersection.ns_server.request(priority=vehicle.priority)
         yield req
 
-    # --- Leave queue when service begins (vehicle is crossing, no longer waiting) ---
-    intersection.ns_leave()
-
     # --- Service (crossing the intersection) ---
     service_time = service_rng.exponential(PARAMS['mu_s'])
     yield env.timeout(service_time)
 
-    # --- Release server ---
+    # --- Release server and leave queue ---
     intersection.ns_server.release(req)
+    intersection.ns_leave()
 
     if will_turn:
         vehicle.turned_at = intersection.name
@@ -617,7 +533,7 @@ def ns_vehicle_at_intersection(env, vehicle, intersection, service_rng,
 
 
 def we_vehicle_process(env, vehicle, intersection, service_rng,
-                       stats=None, warmup=PARAMS['warmup']):
+                       stats=None, warmup=900):
     """
     Process for a W/E vehicle at one intersection.
     Simpler: wait for WE green, request server, cross, exit.
@@ -645,14 +561,12 @@ def we_vehicle_process(env, vehicle, intersection, service_rng,
         req = intersection.we_server.request(priority=PRIORITY_WE_CAR)
         yield req
 
-    # Leave queue when service begins (vehicle is crossing, no longer waiting)
-    intersection.we_leave()
-
     # Service
     svc = service_rng.exponential(PARAMS['mu_s'])
     yield env.timeout(svc)
 
     intersection.we_server.release(req)
+    intersection.we_leave()
 
     # Record stats
     if stats is not None and env.now > warmup:
@@ -662,41 +576,28 @@ def we_vehicle_process(env, vehicle, intersection, service_rng,
 
 
 def southbound_vehicle_process(env, vehicle, intA, intB, link,
-                                service_rng_A, service_rng_B,
-                                turn_rng_A, turn_rng_B, stats,
-                                warmup=PARAMS['warmup']):
+                                service_rng, turn_rng, stats, warmup=900):
     """
     Full lifecycle of a N/S vehicle entering at A.
 
     Turning is pre-decided on arrival at each intersection so that the
     downstream blocking check only applies to straight-going vehicles.
 
-    Delay definition: total corridor time minus free-flow link travel time
-    (20 s).  Intersection service times are included in the reported delay
-    because they may involve signal-induced queuing.  W/E delay uses raw
-    time-in-system at the intersection — both approaches are documented in
-    the report as the assumed reference for each direction.
-
-    Args:
-        service_rng_A: independent RNG stream for NS service at intersection A.
-        service_rng_B: independent RNG stream for NS service at intersection B.
-        turn_rng_A:    independent RNG stream for turning decision at A.
-        turn_rng_B:    independent RNG stream for turning decision at B.
-                       Keeping A and B separate prevents stream contamination:
-                       a vehicle that turns at A draws 0 values from turn_rng_B,
-                       so B decisions are not shifted by A's turning outcomes.
+    Delay definition: total system time minus free-flow link traversal
+    time (20 s).  Service times at intersections are included in delay
+    because they can involve signal-induced queuing.
     """
     vehicle.arrival_at_A = env.now
 
     # Pre-decide turning at A (before joining queue, so blocking check
     # inside ns_vehicle_at_intersection is applied only to through vehicles)
-    will_turn_A = (turn_rng_A.random() < PARAMS['turn_A'])
+    will_turn_A = (turn_rng.random() < PARAMS['turn_A'])
 
     # --- Intersection A ---
     vehicle.service_start_A = env.now
     result_A, svc_A = yield env.process(
         ns_vehicle_at_intersection(
-            env, vehicle, intA, service_rng_A,
+            env, vehicle, intA, service_rng,
             will_turn=will_turn_A,
             link=link,
             stats=stats, warmup=warmup
@@ -712,17 +613,17 @@ def southbound_vehicle_process(env, vehicle, intA, intB, link,
         return
 
     # --- Link A -> B ---
-    yield link.enter(vehicle)
+    yield env.process(link._traverse(vehicle))
     vehicle.arrival_at_B = env.now
 
     # Pre-decide turning at B
-    will_turn_B = (turn_rng_B.random() < PARAMS['turn_B'])
+    will_turn_B = (turn_rng.random() < PARAMS['turn_B'])
 
     # --- Intersection B ---
     vehicle.service_start_B = env.now
     result_B, svc_B = yield env.process(
         ns_vehicle_at_intersection(
-            env, vehicle, intB, service_rng_B,
+            env, vehicle, intB, service_rng,
             will_turn=will_turn_B,
             link=None,
             stats=stats, warmup=warmup
@@ -754,15 +655,11 @@ def southbound_vehicle_process(env, vehicle, intA, intB, link,
 # ============================================================
 
 def south_arrival_generator(env, intA, intB, link, arrival_rng,
-                             classify_rng, service_rng_A, service_rng_B,
-                             turn_rng_A, turn_rng_B,
+                             classify_rng, service_rng, turn_rng,
                              stats, warmup, enable_emergency=True):
     """
     Poisson arrivals from south (λ=900 veh/h).
     Poisson splitting: 85% car, 10% bus, 5% emergency.
-    service_rng_A / service_rng_B: independent NS service streams per intersection.
-    turn_rng_A / turn_rng_B: separate turning-decision streams to prevent stream
-    contamination (vehicles that turn at A never draw from turn_rng_B).
     """
     vid = 0
     while True:
@@ -790,7 +687,7 @@ def south_arrival_generator(env, intA, intB, link, arrival_rng,
         # Launch vehicle process
         env.process(southbound_vehicle_process(
             env, vehicle, intA, intB, link,
-            service_rng_A, service_rng_B, turn_rng_A, turn_rng_B, stats, warmup
+            service_rng, turn_rng, stats, warmup
         ))
 
 
@@ -833,11 +730,6 @@ def compute_time_average(log, sim_time, warmup):
         t_end = t_next
         if t_end > t_start:
             total += v_i * (t_end - t_start)
-    # Include the final interval from the last log entry to sim_time
-    t_last, v_last = log[-1]
-    t_start_last = max(t_last, warmup)
-    if t_start_last < sim_time:
-        total += v_last * (sim_time - t_start_last)
     duration = sim_time - warmup
     return total / duration if duration > 0 else 0.0
 
@@ -947,30 +839,17 @@ def run_replication(seed, offset=0, enable_emergency=True):
     Returns:
         dict of KPIs for this replication
     """
-    # --- Create separate RNG streams (one per independent random source, §2.1) ---
-    # Stream index → purpose
-    #   0  south arrival inter-arrival times
-    #   1  vehicle type classification (car / bus / emergency)
-    #   2  NS intersection service times at A
-    #   3  NS intersection service times at B
-    #   4  turning decisions at A  ← separate from B to avoid stream contamination
-    #   5  turning decisions at B    (vehicles that turn at A draw 0 values from this)
-    #   6  W/E arrival inter-arrival times at A
-    #   7  W/E arrival inter-arrival times at B
-    #   8  W/E intersection service times at A
-    #   9  W/E intersection service times at B
+    # --- Create separate RNG streams ---
     ss = np.random.SeedSequence(seed)
-    seeds = ss.spawn(10)
-    arrival_south_rng  = np.random.default_rng(seeds[0])
-    classify_rng       = np.random.default_rng(seeds[1])
-    service_rng_ns_A   = np.random.default_rng(seeds[2])
-    service_rng_ns_B   = np.random.default_rng(seeds[3])
-    turn_rng_A         = np.random.default_rng(seeds[4])
-    turn_rng_B         = np.random.default_rng(seeds[5])
-    arrival_we_A_rng   = np.random.default_rng(seeds[6])
-    arrival_we_B_rng   = np.random.default_rng(seeds[7])
-    service_rng_we_A   = np.random.default_rng(seeds[8])
-    service_rng_we_B   = np.random.default_rng(seeds[9])
+    seeds = ss.spawn(8)
+    arrival_south_rng = np.random.default_rng(seeds[0])
+    classify_rng = np.random.default_rng(seeds[1])
+    service_rng_ns = np.random.default_rng(seeds[2])
+    turn_rng = np.random.default_rng(seeds[3])
+    arrival_we_A_rng = np.random.default_rng(seeds[4])
+    arrival_we_B_rng = np.random.default_rng(seeds[5])
+    service_rng_we_A = np.random.default_rng(seeds[6])
+    service_rng_we_B = np.random.default_rng(seeds[7])
 
     # --- Create SimPy environment ---
     env = simpy.Environment()
@@ -986,8 +865,8 @@ def run_replication(seed, offset=0, enable_emergency=True):
     # --- Start arrival generators ---
     env.process(south_arrival_generator(
         env, intA, intB, link,
-        arrival_south_rng, classify_rng, service_rng_ns_A, service_rng_ns_B,
-        turn_rng_A, turn_rng_B, stats, PARAMS['warmup'], enable_emergency
+        arrival_south_rng, classify_rng, service_rng_ns, turn_rng,
+        stats, PARAMS['warmup'], enable_emergency
     ))
 
     env.process(we_arrival_generator(
@@ -1021,8 +900,8 @@ def run_replication(seed, offset=0, enable_emergency=True):
 # 10. EXPERIMENT RUNNER
 # ============================================================
 
-def run_experiment(scenario_name, offset, enable_emergency,
-                   n_reps=PARAMS['n_reps'], base_seed=BASE_SEED):
+def run_experiment(scenario_name, offset, enable_emergency, n_reps=20,
+                   base_seed=1000):
     """Run all replications for one scenario."""
     print(f"\n{'='*60}")
     print(f"Scenario: {scenario_name}")
@@ -1086,13 +965,13 @@ if __name__ == '__main__':
     # Scenario 2: Coordinated, no emergencies
     results_2 = run_experiment(
         "2: Coordinated, no emergencies",
-        offset=PARAMS['phi'], enable_emergency=False
+        offset=20, enable_emergency=False
     )
 
     # Scenario 3: Coordinated, with emergencies
     results_3 = run_experiment(
         "3: Coordinated, with emergencies",
-        offset=PARAMS['phi'], enable_emergency=True
+        offset=20, enable_emergency=True
     )
 
     print("\n\nDone! All three scenarios completed.")
