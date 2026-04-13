@@ -143,6 +143,7 @@ class SignalController:
         self.interrupted_remaining = 0
         self.preemption_count = 0
         self.recovery_times = []
+        self._preempt_emergency_service_end = None
 
         # Tracks the scheduled end-time of the current phase (for interrupted_remaining)
         self._phase_end_time = 0
@@ -263,6 +264,7 @@ class SignalController:
         # Need to preempt!
         self.preempting = True
         self.preemption_count += 1
+        self._preempt_emergency_service_end = None
 
         # Record where we are in the cycle and how much time remains in the phase
         self.interrupted_phase = self.phase
@@ -275,6 +277,16 @@ class SignalController:
         # Start preemption sequence
         preempt_proc = self.env.process(self._preemption_sequence())
         return preempt_proc
+
+    def note_emergency_service_complete(self, t_done):
+        """
+        Record emergency service completion time during an active preemption.
+        Used for KPI recovery-time anchor ("end of emergency service").
+        """
+        if self.preempting:
+            if (self._preempt_emergency_service_end is None or
+                    t_done > self._preempt_emergency_service_end):
+                self._preempt_emergency_service_end = t_done
 
     def _preemption_sequence(self):
         """Execute preemption: clearance -> emergency green -> amber -> resume from
@@ -291,18 +303,21 @@ class SignalController:
         self._fire_ns_green()
         yield self.env.timeout(self.p['emergency_green'])
         self._reset_ns_event()
-        _emergency_end = self.env.now
+        _emergency_green_end = self.env.now
 
         # 3. Amber transition back
         self._set_phase(self.AMBER_NS)
         yield self.env.timeout(self.p['amber'])
 
+        recovery_anchor = self._preempt_emergency_service_end
+        if recovery_anchor is None:
+            recovery_anchor = _emergency_green_end
         self.preempting = False
 
         # 4. Complete the interrupted phase's remaining time, then restart the
         #    normal cycle.  Recovery time is recorded inside _resume_from_interrupted
         #    once the cycle is truly back on its regular track.
-        yield from self._resume_from_interrupted(_emergency_end)
+        yield from self._resume_from_interrupted(recovery_anchor)
 
     def _resume_from_interrupted(self, emergency_end):
         """Serve out the remaining time of the phase that was interrupted, continue
@@ -606,6 +621,10 @@ def ns_vehicle_at_intersection(env, vehicle, intersection, service_rng,
     service_time = service_rng.exponential(PARAMS['mu_s'])
     yield env.timeout(service_time)
 
+    # Used for scenario-3 recovery KPI: end of emergency service.
+    if is_emergency:
+        intersection.signal.note_emergency_service_complete(env.now)
+
     # --- Release server ---
     intersection.ns_server.release(req)
 
@@ -655,7 +674,7 @@ def we_vehicle_process(env, vehicle, intersection, service_rng,
     intersection.we_server.release(req)
 
     # Record stats
-    if stats is not None and env.now > warmup:
+    if stats is not None and vehicle.created_at >= warmup:
         delay = env.now - arrive_time
         stats[f'we_delay_{intersection.name}'].append(delay)
     vehicle.exited = True
@@ -707,7 +726,7 @@ def southbound_vehicle_process(env, vehicle, intA, intB, link,
 
     if result_A == 'turned':
         vehicle.exited = True
-        if env.now > warmup and stats is not None:
+        if vehicle.created_at >= warmup and stats is not None:
             stats['turned_A_delay'].append(vehicle.departure_A - vehicle.arrival_at_A)
         return
 
@@ -733,7 +752,7 @@ def southbound_vehicle_process(env, vehicle, intA, intB, link,
     vehicle.exited = True
 
     # --- Record stats (post-warmup only) ---
-    if env.now > warmup and stats is not None:
+    if vehicle.created_at >= warmup and stats is not None:
         # Delay = total time − free-flow link travel time (20 s)
         free_flow_link = PARAMS['L'] / PARAMS['vf']
         delay = (vehicle.departure_B - vehicle.arrival_at_A) - free_flow_link
@@ -741,12 +760,14 @@ def southbound_vehicle_process(env, vehicle, intA, intB, link,
         if result_B == 'turned':
             stats['turned_B_delay'].append(delay)
         else:
-            # Separate emergency delays so they don't dilute car/bus average
+            # Through delay KPI includes all S->N through vehicles (car/bus/emergency).
+            stats['through_delay_all'].append(delay)
+            # Keep emergency-specific delay for scenario-3 breakdown.
             if vehicle.vtype == 'emergency':
                 stats['emergency_through_delay'].append(delay)
             else:
                 stats['through_delay'].append(delay)
-            stats['throughput_exits'].append(env.now)
+            stats['throughput_exits'].append((vehicle.created_at, env.now))
 
 
 # ============================================================
@@ -882,8 +903,11 @@ def compute_kpis(stats, link, intA, intB, sim_time, warmup):
     duration = sim_time - warmup
     kpis = {}
 
-    # 1a. Average delay — through NS traffic (cars and buses only)
-    through = stats.get('through_delay', [])
+    # 1a. Average delay — through NS traffic (all vehicle classes)
+    through = stats.get('through_delay_all', [])
+    if not through:
+        # Backward-compatible fallback for old stats dictionaries.
+        through = stats.get('through_delay', []) + stats.get('emergency_through_delay', [])
     kpis['avg_delay_through'] = np.mean(through) if through else 0.0
 
     # 1b. Average delay — W/E traffic
@@ -904,7 +928,15 @@ def compute_kpis(stats, link, intA, intB, sim_time, warmup):
         kpis[f'avg_queue_{label}'] = avg_q
 
     # 3. Throughput (vehicles/hour exiting north at B)
-    exits = [t for t in stats.get('throughput_exits', []) if t > warmup]
+    exits = []
+    for item in stats.get('throughput_exits', []):
+        if isinstance(item, tuple):
+            arr_t, exit_t = item
+            if arr_t >= warmup:
+                exits.append(exit_t)
+        elif item > warmup:
+            # Backward-compatible fallback
+            exits.append(item)
     kpis['throughput_per_hour'] = len(exits) / (duration / 3600) if duration > 0 else 0
 
     # 4. Average link occupancy
