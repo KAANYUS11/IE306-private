@@ -451,9 +451,10 @@ class Link:
 
     def travel_time(self):
         """Compute travel time based on current occupancy."""
-        if self.n >= self.Nmax:
-            return self.free_flow_time  # fallback for emergency
-        ratio = self.n / self.Nmax
+        # Emergency vehicles may enter even when n >= Nmax.
+        # Cap effective occupancy to avoid division by zero / negative denominator.
+        n_eff = min(self.n, self.Nmax - 1)
+        ratio = n_eff / self.Nmax
         return self.free_flow_time / (1 - ratio)
 
     def enter(self, vehicle):
@@ -879,7 +880,8 @@ def compute_queue_stats(log, sim_time, warmup):
     if not relevant:
         return last_before, float(last_before)
 
-    max_q = max(v for _, v in relevant)
+    # Include the carry-over level at warm-up boundary in max computation.
+    max_q = max([last_before] + [v for _, v in relevant])
 
     # Time-weighted average over [warmup, sim_time]
     total = 0.0

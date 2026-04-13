@@ -49,3 +49,34 @@ Warm-up handling is now consistent with entry-based filtering for vehicle-level 
 ## Verification
 - Executed full `assignment.py` run (all 3 scenarios, 20 replications each) after edits.
 - Run completed successfully with no runtime errors.
+
+## 4) Link travel time fallback corrected for over-capacity emergency entries
+
+### Problem
+When link occupancy reached or exceeded `Nmax`, `travel_time()` returned free-flow time (`20s`) as a fallback. This made emergency vehicles unrealistically fast exactly under the most congested states.
+
+### Fix
+- Replaced the fallback with an effective-occupancy cap:
+  - `n_eff = min(n, Nmax - 1)`
+  - `t = t_ff / (1 - n_eff/Nmax)`
+- This prevents division-by-zero while preserving congestion-sensitive growth of travel time.
+
+### Impact
+Emergency vehicles still bypass downstream blocking as required, but no longer receive artificially optimistic link travel times under jammed conditions.
+
+## 5) Warm-up boundary bug in maximum queue calculation fixed
+
+### Problem
+`compute_queue_stats()` computed `max_q` only from events with `t >= warmup`, but ignored the carry-over queue level that existed exactly at the warm-up boundary (`last_before`).
+
+### Fix
+- Updated max calculation to include both:
+  - carry-over value at warm-up boundary (`last_before`), and
+  - post-warmup event values.
+
+### Impact
+`max_queue_*` KPIs now correctly reflect the true maximum over `[warmup, sim_time]`, including boundary carry-over states.
+
+## Additional note on preemption/recovery counts
+
+A difference between `preemptions_total` and the number of recorded recovery samples can occur when a preemption starts close to simulation end (`t=7200`) and recovery has not completed yet. In that case, the event is still a valid preemption, but a full recovery duration is not yet observable within the finite run horizon.
